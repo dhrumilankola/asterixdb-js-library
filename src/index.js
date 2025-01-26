@@ -1,13 +1,26 @@
-const { generateSQLpp } = require('./llm/llm');
+const { processQuery } = require('./llm/llm');
 const { executeQuery } = require('./asterixdb/asterixdb');
 
-async function main() {
-  const naturalQuery = "Get the names of users older than 30.";
-  const sqlppQuery = await generateSQLpp(naturalQuery);
-  console.log(`Generated SQL++ Query: ${sqlppQuery}`);
+/**
+ * Main interface function for developers
+ */
+async function queryAsterixDB(dataverseName, naturalQuery) {
+  try {
+      const sqlppQuery = await processQuery(dataverseName, naturalQuery);
 
-  const result = await executeQuery(sqlppQuery);
-  console.log('Query Result:', result);
+      if (!sqlppQuery || typeof sqlppQuery !== 'string') {
+          throw new Error('Invalid SQL++ query generated.');
+      }
+
+      return await executeQuery(sqlppQuery);
+  } catch (error) {
+      console.error('Error processing query:', error.message);
+      throw error;
+  }
 }
 
-main().catch(console.error);
+module.exports = {
+    queryAsterixDB,
+    fetchAllMetadata: require('./asterixdb/asterixdb').fetchAllMetadata,
+    extractMetadata: require('./asterixdb/asterixdb').extractMetadata
+};

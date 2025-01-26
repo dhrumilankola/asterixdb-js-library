@@ -4,30 +4,7 @@ const dotenv = require('dotenv');
 // Load environment variables
 dotenv.config();
 
-// Function to extract metadata
-function extractMetadata(rawResponse) {
-  try {
-    const results = rawResponse.results;
-    const metadata = results.map(result => {
-      const datatypeName = result.DatatypeName;
-      const fields = result.Derived?.Record?.Fields?.map(field => ({
-        name: field.FieldName,
-        type: field.FieldType,
-        nullable: field.IsNullable
-      })) || [];
 
-      return {
-        datatypeName,
-        fields
-      };
-    });
-
-    return metadata;
-  } catch (error) {
-    console.error('Error extracting metadata:', error);
-    throw error;
-  }
-}
 
 // Test the fetchMetadata and extractMetadata functions
 (async () => {

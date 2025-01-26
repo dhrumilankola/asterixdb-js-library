@@ -1,23 +1,41 @@
 // Import required libraries
-const { pipeline } = require('@huggingface/transformers');
 const dotenv = require('dotenv');
+const { fetchAllMetadata, extractMetadata } = require('../asterixdb/asterixdb');
 
 dotenv.config();
 
+const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
+const MODEL_ENDPOINT = 'https://api-inference.huggingface.co/models/defog/sqlcoder-7b-2';
+
+
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+
 /**
- * Load the SQLCoder-7B-2 model from Hugging Face.
- * @returns {Promise<Object>} The loaded model pipeline.
+ * Query the Hugging Face Inference API with a given input.
+ * @param {string} prompt - The prompt to send to the model.
+ * @returns {Promise<string>} The response from the model.
  */
-async function loadModel() {
+async function queryHuggingFaceAPI(prompt) {
   try {
-    // Load the text-generation pipeline with the SQLCoder-7B-2 model
-    const model = await pipeline('text-generation', 'defog/sqlcoder-7b-2', {
-      device: 'cpu', // Use 'cuda' for GPU acceleration if available
-    });
-    return model;
+      const response = await fetch(MODEL_ENDPOINT, {
+          method: 'POST',
+          headers: {
+              Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
+              'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ inputs: prompt }),
+      });
+
+      if (!response.ok) {
+          const errorDetails = await response.text();
+          throw new Error(`Hugging Face API error: ${response.status} - ${errorDetails}`);
+      }
+
+      const result = await response.json();
+      return result[0]?.generated_text || '';
   } catch (error) {
-    console.error('Error loading the model:', error);
-    throw error;
+      console.error('Error querying Hugging Face API:', error.message);
+      throw error;
   }
 }
 
@@ -28,12 +46,9 @@ async function loadModel() {
  * @returns {Promise<string>} The generated SQL++ query.
  */
 async function generateSQLpp(naturalQuery, schemaMetadata) {
-  try {
-    // Load the model
-    const model = await loadModel();
-
-    // Construct the prompt as per the model's requirements
-    const prompt = `
+    try {
+        // Construct the prompt
+        const prompt = `
 ### Task
 Generate a SQL query to answer [QUESTION]${naturalQuery}[/QUESTION]
 
@@ -46,43 +61,74 @@ Given the database schema, here is the SQL query that [QUESTION]${naturalQuery}[
 [SQL]
 `;
 
-    // Generate the SQL++ query
-    const response = await model(prompt, {
-      max_length: 200, // Adjust based on the expected query length
-      num_beams: 4, // Use beam search for better results
-      do_sample: false, // Disable sampling for deterministic output
-    });
-
-    // Extract the generated SQL++ query
-    const sqlppQuery = response[0].generated_text;
-    return sqlppQuery;
-  } catch (error) {
-    console.error('Error generating SQL++ query:', error);
-    throw error;
-  }
+        // Query the Hugging Face Inference API
+        const sqlppQuery = await queryHuggingFaceAPI(prompt);
+        return sqlppQuery.trim();
+    } catch (error) {
+        console.error('Error generating SQL++ query:', error.message);
+        throw error;
+    }
 }
 
-// Example usage
-(async () => {
-  try {
-    // Example natural language query
-    const naturalQuery = "Get the names of users older than 30.";
+/**
+ * Infer the relevant dataset and fields from a natural language query.
+ * @param {string} naturalQuery - The natural language query.
+ * @param {Array<Object>} metadata - The metadata for all datasets in the dataverse.
+ * @returns {Promise<string>} The inferred dataset and fields.
+ */
+async function inferDatasetAndFields(naturalQuery, metadata) {
+    try {
+        // Construct the prompt for dataset inference
+        const prompt = `
+### Task
+Identify the relevant dataset and fields from the following natural language query:
+[QUERY]${naturalQuery}[/QUERY]
 
-    // Example database schema metadata (in DDL format)
-    const schemaMetadata = `
-CREATE TABLE users (
-  id INT PRIMARY KEY,
-  name VARCHAR(255),
-  age INT
-);
+### Available Datasets
+${metadata.map(ds => ds.dataset.datasetName).join(', ')}
+
+### Answer
+The relevant dataset and fields are:
 `;
 
-    // Generate the SQL++ query
-    const sqlppQuery = await generateSQLpp(naturalQuery, schemaMetadata);
-    console.log('Generated SQL++ Query:', sqlppQuery);
-  } catch (error) {
-    console.error('Error in example usage:', error);
-  }
-})();
+        // Query the Hugging Face Inference API
+        const inferenceResult = await queryHuggingFaceAPI(prompt);
+        return inferenceResult.trim();
+    } catch (error) {
+        console.error('Error inferring dataset and fields:', error.message);
+        throw error;
+    }
+}
 
-module.exports = { generateSQLpp };
+/**
+ * Process a natural language query by fetching metadata, inferring the dataset, and generating a SQL++ query.
+ * @param {string} dataverseName - The name of the dataverse.
+ * @param {string} naturalQuery - The natural language query.
+ * @returns {Promise<string>} The generated SQL++ query.
+ */
+async function processQuery(dataverseName, naturalQuery) {
+    try {
+        const rawMetadata = await fetchAllMetadata(dataverseName);
+        const metadata = extractMetadata(rawMetadata);
+
+        if (!metadata?.length) {
+            throw new Error(`No metadata found for dataverse: ${dataverseName}`);
+        }
+
+        const inferenceResult = await inferDatasetAndFields(naturalQuery, metadata);
+        const relevantMetadata = metadata.find(
+            ds => ds.dataset.datasetName === inferenceResult.datasetName
+        );
+
+        if (!relevantMetadata) {
+            throw new Error(`Dataset not found in metadata: ${inferenceResult.datasetName}`);
+        }
+
+        return await generateSQLpp(naturalQuery, JSON.stringify(relevantMetadata));
+    } catch (error) {
+        console.error('Query processing failed:', error.message);
+        throw error;
+    }
+}
+
+module.exports = { generateSQLpp, inferDatasetAndFields, processQuery };
