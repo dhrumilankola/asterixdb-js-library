@@ -1,140 +1,128 @@
-// Import required libraries
 const axios = require('axios');
 const dotenv = require('dotenv');
 
-// Load environment variables
 dotenv.config();
 
-// AsterixDB HTTP API configuration
 const ASTERIXDB_URL = process.env.ASTERIXDB_URL || 'http://localhost:19002/query/service';
+
+/**
+ * Prepends USE dataverse statement to a query
+ * @param {string} dataverseName - The name of the dataverse
+ * @param {string} query - The SQL++ query
+ * @returns {string} The complete query with USE statement
+ */
+function prependDataverseContext(dataverseName, query) {
+    return `USE \`${dataverseName}\`;\n${query}`;
+}
 
 /**
  * Fetch metadata for all datasets in a dataverse.
  * @param {string} dataverseName - The name of the dataverse.
- * @returns {Promise<Object>} The metadata for all datasets in the dataverse.
+ * @returns {Promise<Object>} The raw metadata response from AsterixDB.
  */
 async function fetchAllMetadata(dataverseName) {
     try {
-        // Query to fetch metadata for all datasets in the specified dataverse
         const metadataQuery = `
-            USE Metadata;
-            SELECT {
-                "Dataset": ds,
-                "Datatype": tp,
-                "Indexes": (
-                    SELECT VALUE ix
-                    FROM \`Index\` ix
-                    WHERE ix.DataverseName = ds.DataverseName AND ix.DatasetName = ds.DatasetName
+            SELECT VALUE {
+                "datasetName": ds.DatasetName,
+                "primaryKey": ds.InternalDetails.PrimaryKey,
+                "fields": (
+                    SELECT VALUE {
+                        "name": f.FieldName,
+                        "type": f.FieldType
+                    }
+                    FROM tp.Derived.Record.Fields f
                 )
             }
-            FROM \`Dataset\` ds
-            JOIN \`Datatype\` tp
-            ON ds.DataverseName = tp.DataverseName AND ds.DatatypeName = tp.DatatypeName
+            FROM \`Metadata\`.\`Dataset\` ds
+            JOIN \`Metadata\`.\`Datatype\` tp
+            ON ds.DataverseName = tp.DataverseName 
+            AND ds.DatatypeName = tp.DatatypeName
             WHERE ds.DataverseName = "${dataverseName}";
         `;
 
-        // Send the query to AsterixDB
+        console.log("Debug: Executing metadata query:", metadataQuery);
+
         const response = await axios.post(ASTERIXDB_URL, {
             statement: metadataQuery,
             format: 'json',
         });
 
-        // Log the full response
-        console.log('Full response:', JSON.stringify(response.data, null, 2));
+        console.log("Debug: Full raw response:", JSON.stringify(response.data, null, 2));
 
-        // Return the raw response for debugging
+        if (!response.data || !response.data.results) {
+            throw new Error(`Invalid or empty metadata results for dataverse: ${dataverseName}`);
+        }
+
         return response.data;
     } catch (error) {
-        console.error('Error fetching metadata:', error);
+        console.error(`Error fetching metadata for dataverse "${dataverseName}":`, error.message);
+        if (error.response?.data) {
+            console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+        }
         throw error;
     }
 }
 
 /**
- * Extract and format metadata from the raw response.
+ * Extract structured metadata from the raw AsterixDB response.
  * @param {Object} rawResponse - The raw response from AsterixDB.
- * @returns {Object} The extracted and formatted metadata.
+ * @returns {Array} Array of structured metadata objects.
  */
 function extractMetadata(rawResponse) {
-  try {
-      const results = rawResponse.results;
+    try {
+        const results = rawResponse.results;
 
-      // Map each result, accounting for the `$1` wrapper
-      const metadata = results.map(result => {
-          const metadataEntry = result.$1; // Access the `$1` object
-          if (!metadataEntry) {
-              throw new Error('Metadata entry is missing the $1 key');
-          }
+        if (!Array.isArray(results) || results.length === 0) {
+            console.error("Debug: rawResponse.results structure:", JSON.stringify(results, null, 2));
+            throw new Error('Metadata results are empty or not an array.');
+        }
 
-          const dataset = metadataEntry.Dataset;
-          const datatype = metadataEntry.Datatype;
-          const indexes = metadataEntry.Indexes;
-
-          if (!dataset || !datatype || !indexes) {
-              throw new Error('Missing Dataset, Datatype, or Indexes in metadata entry');
-          }
-
-          return {
-              dataset: {
-                  datasetName: dataset.DatasetName,
-                  dataverseName: dataset.DataverseName,
-                  primaryKey: dataset.InternalDetails.PrimaryKey,
-                  partitioningKey: dataset.InternalDetails.PartitioningKey,
-                  datasetType: dataset.DatasetType,
-                  storageFormat: dataset.DatasetFormat?.Format || 'Unknown',
-              },
-              datatype: {
-                  datatypeName: datatype.DatatypeName,
-                  dataverseName: datatype.DataverseName,
-                  fields: datatype.Derived.Record.Fields.map(field => ({
-                      name: field.FieldName,
-                      type: field.FieldType,
-                      nullable: field.IsNullable,
-                      missable: field.IsMissable,
-                  })),
-              },
-              indexes: indexes.map(index => ({
-                  indexName: index.IndexName,
-                  datasetName: index.DatasetName,
-                  dataverseName: index.DataverseName,
-                  indexType: index.IndexStructure,
-                  searchKey: index.SearchKey,
-                  isPrimary: index.IsPrimary,
-              })),
-          };
-      });
-
-      return metadata;
-  } catch (error) {
-      console.error('Error extracting metadata:', error.message);
-      throw error;
-  }
+        return results.map(dataset => ({
+            datasetName: dataset.datasetName,
+            primaryKey: dataset.primaryKey || [],
+            fields: dataset.fields || []
+        }));
+    } catch (error) {
+        console.error('Error extracting metadata:', error.message);
+        throw error;
+    }
 }
-
 
 /**
  * Execute a SQL++ query on AsterixDB.
  * @param {string} query - The SQL++ query to execute.
- * @returns {Promise<Object>} The query results.
+ * @param {string} dataverseName - The name of the dataverse to use.
+ * @returns {Promise<Array>} The query results.
  */
-async function executeQuery(query) {
+async function executeQuery(query, dataverseName) {
     try {
-        // Send the query to AsterixDB
+        // Prepend the USE statement to the query
+        const fullQuery = prependDataverseContext(dataverseName, query);
+        console.log("Debug: Executing full query:", fullQuery);
+
         const response = await axios.post(ASTERIXDB_URL, {
-            statement: query,
+            statement: fullQuery,
             format: 'json',
         });
 
-        // Return the query results
+        if (!response.data || !response.data.results) {
+            throw new Error('Query returned no results.');
+        }
+
         return response.data.results;
     } catch (error) {
-        console.error('Error executing query:', error);
+        console.error('Error executing query:', error.message);
+        if (error.response?.data) {
+            console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+        }
         throw error;
     }
 }
 
 module.exports = {
-  fetchAllMetadata,
-  extractMetadata,
-  executeQuery
+    fetchAllMetadata,
+    extractMetadata,
+    executeQuery,
+    prependDataverseContext, // Exported for testing
 };
